@@ -36,8 +36,7 @@ from apps.rtagent.backend.src.agents.artagent.tool_store.tools_helper import (
     push_tool_start,
 )
 from apps.rtagent.backend.src.helpers import add_space
-from apps.rtagent.backend.src.services.openai_services import client as az_openai_client
-from src.pools.aoai_pool import get_session_client
+from src.aoai.client import client as default_aoai_client
 from apps.rtagent.backend.src.ws_helpers.shared_ws import (
     broadcast_message,
     push_final,
@@ -83,9 +82,6 @@ AOAI_RETRY_BASE_DELAY_SEC: float = _env_float("AOAI_RETRY_BASE_DELAY_SEC", 0.5)
 AOAI_RETRY_MAX_DELAY_SEC: float = _env_float("AOAI_RETRY_MAX_DELAY_SEC", 8.0)
 AOAI_RETRY_BACKOFF_FACTOR: float = _env_float("AOAI_RETRY_BACKOFF_FACTOR", 2.0)
 AOAI_RETRY_JITTER_SEC: float = _env_float("AOAI_RETRY_JITTER_SEC", 0.2)
-
-# 🚀 AOAI Client Pool Configuration
-AOAI_USE_SESSION_POOL: bool = os.getenv("AOAI_USE_SESSION_POOL", "true").lower() == "true"
 
 
 @dataclass
@@ -252,15 +248,15 @@ def _set_span_rate_limit(span, info: RateLimitInfo) -> None:
         span.set_attribute("aoai.reset_tokens", info.reset_tokens)
 
 
-def _inspect_client_retry_settings() -> None:
+def _inspect_client_retry_settings(client: Any) -> None:
     """
     Log the SDK client's built-in retry behavior if discoverable.
 
     Many OpenAI/AzureOpenAI client versions expose a 'max_retries' property.
     """
     try:
-        max_retries = getattr(az_openai_client, "max_retries", None)
-        transport = getattr(az_openai_client, "transport", None)
+        max_retries = getattr(client, "max_retries", None)
+        transport = getattr(client, "transport", None)
         logger.info("AOAI SDK retry: max_retries=%s transport=%s", max_retries, type(transport).__name__ if transport else None)
     except Exception:
         pass
@@ -731,7 +727,8 @@ async def _openai_stream_with_retry(
     *,
     model_id: str,
     dep_span,  # active OTEL span for dependency call
-    session_id: Optional[str] = None,  # NEW: Session ID for client pooling
+    session_id: Optional[str] = None,
+    client: Optional[Any] = None,
 ) -> Tuple[Iterable[Any], RateLimitInfo]:
     """
     Invoke AOAI streaming with explicit retry and capture rate-limit headers.
@@ -742,26 +739,12 @@ async def _openai_stream_with_retry(
     We try the SDK's streaming-response context (if present) to access headers.
     Falls back to normal `.create(**kwargs)`.
     """
-    _inspect_client_retry_settings()
+    aoai_client = client or default_aoai_client
+    _inspect_client_retry_settings(aoai_client)
 
     attempts = 0
     last_info = RateLimitInfo()
     aoai_host = urlparse(AZURE_OPENAI_ENDPOINT).netloc or "api.openai.azure.com"
-
-    # Get session-specific client to avoid resource contention
-    if AOAI_USE_SESSION_POOL and session_id:
-        try:
-            pooled_client = await get_session_client(session_id)
-            if pooled_client:
-                aoai_client = pooled_client
-                logger.info(f"Using session-specific AOAI client for {session_id}")
-            else:
-                aoai_client = az_openai_client
-        except Exception as e:
-            logger.warning(f"Failed to get session AOAI client for {session_id}, falling back to shared client: {e}")
-            aoai_client = az_openai_client
-    else:
-        aoai_client = az_openai_client
 
     logger.info(
         "Starting AOAI stream request: model=%s host=%s max_attempts=%d",
@@ -773,7 +756,7 @@ async def _openai_stream_with_retry(
             "aoai_host": aoai_host,
             "max_attempts": AOAI_RETRY_MAX_ATTEMPTS,
             "session_id": session_id,
-            "using_pooled_client": session_id is not None,
+            "client_type": type(aoai_client).__name__,
             "event_type": "aoai_stream_start"
         }
     )
@@ -1151,8 +1134,13 @@ async def process_gpt_response(  # noqa: PLR0913
                 except Exception:
                     pass
 
+                aoai_client = getattr(ws.app.state, "aoai_client", default_aoai_client)
                 response_stream, last_rate_info = await _openai_stream_with_retry(
-                    chat_kwargs, model_id=model_id, dep_span=dep_span, session_id=session_id
+                    chat_kwargs,
+                    model_id=model_id,
+                    dep_span=dep_span,
+                    session_id=session_id,
+                    client=aoai_client,
                 )
 
                 # Consume the stream and emit chunks

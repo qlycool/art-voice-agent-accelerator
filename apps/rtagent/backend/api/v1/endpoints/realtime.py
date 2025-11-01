@@ -692,8 +692,26 @@ async def _initialize_conversation_session(
         except Exception as e:
             logger.debug(f"Failed to dispatch UI cancel control: {e}")
 
-    def on_final(txt: str, lang: str):
-        logger.info(f"[{session_id}] User (final) in {lang}: {txt}")
+    def on_cancel(evt) -> None:
+        try:
+            details = getattr(evt.result, "cancellation_details", None)
+            reason = getattr(details, "reason", None) if details else None
+            error_details = getattr(details, "error_details", None) if details else None
+            logger.warning(
+                "[%s] STT cancellation received (reason=%s, error=%s)",
+                session_id,
+                reason,
+                error_details,
+            )
+        except Exception as cancel_exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] STT cancellation event could not be parsed: %s",
+                session_id,
+                cancel_exc,
+            )
+
+    def on_final(txt: str, lang: str, speaker_id: Optional[str] = None):
+        logger.info(f"[{session_id}] User {speaker_id} (final) in {lang}: {txt}")
         current_buffer = get_metadata("user_buffer", "")
         set_metadata("user_buffer", current_buffer + txt.strip() + "\n")
 
@@ -729,8 +747,17 @@ async def _initialize_conversation_session(
         raise WebSocketDisconnect(code=1013) from exc
 
     set_metadata("stt_client", stt_client)
+    try:
+        stt_client.set_call_connection_id(session_id)
+    except Exception as set_conn_exc:
+        logger.debug(
+            "[%s] Unable to attach call_connection_id to STT client: %s",
+            session_id,
+            set_conn_exc,
+        )
     stt_client.set_partial_result_callback(on_partial)
     stt_client.set_final_result_callback(on_final)
+    stt_client.set_cancel_callback(on_cancel)
     stt_client.start()
 
     # Persist the already-acquired TTS client into metadata
@@ -839,9 +866,31 @@ async def _process_conversation_messages(
                     msg.get("type") == "websocket.receive"
                     and msg.get("bytes") is not None
                 ):
+                    audio_bytes = msg["bytes"]
+                    first_audio_logged = get_metadata("_audio_first_logged", False)
+                    if not first_audio_logged:
+                        logger.info(
+                            "[%s] Received initial audio frame (%s bytes)",
+                            session_id,
+                            len(audio_bytes),
+                        )
+                        set_metadata("_audio_first_logged", True)
+
                     stt_client = get_metadata("stt_client")
                     if stt_client:
-                        stt_client.write_bytes(msg["bytes"])
+                        if getattr(stt_client, "push_stream", None) is None:
+                            logger.warning(
+                                "[%s] STT push_stream not ready; dropping audio frame",
+                                session_id,
+                            )
+                        try:
+                            stt_client.write_bytes(audio_bytes)
+                        except Exception as write_exc:  # noqa: BLE001
+                            logger.error(
+                                "[%s] Failed to write audio to recognizer: %s",
+                                session_id,
+                                write_exc,
+                            )
 
                 # Process accumulated user buffer (moved outside audio handling to prevent duplication)
                 user_buffer = get_metadata("user_buffer", "")
@@ -1160,20 +1209,6 @@ async def _cleanup_conversation_session(
                     connection.meta.handler["tts_client"] = None
                     connection.meta.handler["audio_playing"] = False
                     connection.meta.handler["tts_cancel_event"] = None
-
-                #  Release session-specific AOAI client
-                if session_id:
-                    try:
-                        from src.pools.aoai_pool import release_session_client
-
-                        await release_session_client(session_id)
-                        logger.info(
-                            f"[{session_id}] Released dedicated AOAI client"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"[{session_id}] Error releasing AOAI client: {e}"
-                        )
 
                 # Clean up STT client
                 stt_client = connection.meta.handler.get("stt_client")
